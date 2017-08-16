@@ -32,9 +32,11 @@ CLOUDSTACK = 'CloudStack'
 RACKSPACE = 'Rackspace'
 MESOS = 'Mesos'
 PROFITBRICKS = 'ProfitBricks'
+VCLOUD = 'vCloud'
 
 VALID_CLOUDS = (GCP, AZURE, AWS, DIGITALOCEAN, KUBERNETES, OPENSTACK,
-                RACKSPACE, CLOUDSTACK, ALICLOUD, MESOS, PROFITBRICKS)
+                RACKSPACE, CLOUDSTACK, ALICLOUD, MESOS, PROFITBRICKS,
+                VCLOUD)
 
 
 _imported_providers = set()
