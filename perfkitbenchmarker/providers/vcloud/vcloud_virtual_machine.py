@@ -38,7 +38,7 @@ CLOUD_CONFIG_TEMPLATE = '''#!/bin/bash
 /usr/sbin/useradd -m -s /bin/bash -G wheel {0}
 mkdir ~{0}/.ssh
 echo '{1}' > ~{0}/.ssh/authorized_keys
-chown {0}:{0} ~{0}/.ssh/authorized_keys
+chown -R {0}:{0} ~{0}/.ssh
 chmod 500 ~{0}/.ssh/authorized_keys
 echo '{0} ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
 service firewalld stop
