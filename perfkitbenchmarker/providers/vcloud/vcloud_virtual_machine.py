@@ -45,6 +45,10 @@ service firewalld stop
 yum clean all
 '''
 
+LSBLK_REGEX = (r'NAME="(.*)"\s+MODEL="(.*)"\s+SIZE="(.*)"'
+               r'\s+TYPE="(.*)"\s+MOUNTPOINT="(.*)"\s+LABEL="(.*)"')
+LSBLK_PATTERN = re.compile(LSBLK_REGEX)
+
 UBUNTU_IMAGE = 'Ubuntu'
 RHEL_IMAGE = 'Redhat'
 
@@ -114,6 +118,7 @@ class vCloudVirtualMachine(virtual_machine.BaseVirtualMachine):
     self.vcloud_catalog = vm_spec.vcloud_catalog
     self.vcloud_vdc = vm_spec.vcloud_vdc
     self.vcloud_network = vm_spec.vcloud_network
+    self.allocated_disks = set()
 
   def _CreateDependencies(self):
     """Create dependencies prior creating the VM."""
@@ -286,6 +291,10 @@ class vCloudVirtualMachine(virtual_machine.BaseVirtualMachine):
     #  raise errors.Resource.RetryableDeletionError(
     #      'VM: %s has not been deleted. Retrying to check status.' % self.name)
 
+  def OnStartup(self):
+    """Executes commands on the VM immediately after it has booted."""
+    super(vCloudVirtualMachine, self).OnStartup()
+    self.boot_device = self._GetBootDevice()
 
   def CreateScratchDisk(self, disk_spec):
       """Create a VM's scratch disk.
@@ -296,7 +305,7 @@ class vCloudVirtualMachine(virtual_machine.BaseVirtualMachine):
       if disk_spec.disk_type == vcloud_disk.BOOT:  # Ignore num_striped_disks
         self._AllocateBootDisk(disk_spec)
       elif disk_spec.disk_type == vcloud_disk.LOCAL:
-        self._AllocateBootDisk(disk_spec)
+        self._AllocateLocalDisk(disk_spec)
       else:
         raise errors.Error('Unsupported data disk type: %s' % disk_spec.disk_type)
 
@@ -326,29 +335,124 @@ class vCloudVirtualMachine(virtual_machine.BaseVirtualMachine):
 
 
   def _AllocateLocalDisk(self, disk_spec):
-    """Allocate the VM's boot, or system, disk as the scratch disk.
+    """Allocate the VM's local disks (included with the VM), as a data disk(s).
 
-    Boot disk can only be allocated once. If multiple data disks are required
-    it will raise an error.
+    A local disk can only be allocated once per data disk.
 
     Args:
       disk_spec: virtual_machine.BaseDiskSpec object of the disk.
+    """
+    block_devices = self._GetBlockDevices()
+    free_blk_devices = self._GetFreeBlockDevices(block_devices, disk_spec)
+    disks = []
+    for i in range(disk_spec.num_striped_disks):
+      local_device = free_blk_devices[i]
+      disk_name = '%s-local-disk-%d' % (self.name, i)
+      device_path = '/dev/%s' % local_device['name']
+      local_disk = vcloud_disk.vCloudLocalDisk(
+          disk_spec, disk_name, device_path)
+      self.allocated_disks.add(local_disk)
+      disks.append(local_disk)
+    self._CreateScratchDiskFromDisks(disk_spec, disks)
+
+  def _GetFreeBlockDevices(self, block_devices, disk_spec):
+    """Returns available block devices that are not in used as data disk or as
+    a boot disk.
+
+    Args:
+      block_devices: list of dict containing information about all block devices
+          in the VM.
+      disk_spec: virtual_machine.BaseDiskSpec of the disk.
+
+    Returns:
+      list of dicts of only block devices that are not being used.
 
     Raises:
-      errors.Error when boot disk has already been allocated as a data disk.
+      errors.Error Whenever there are no available block devices.
     """
-    #if self.boot_disk_allocated:
-    #  raise errors.Error('Only one boot disk can be created per VM')
-    #device_path = '/dev/%s' % self.boot_device['name']
-    device_path = 'boot-disk'
-    scratch_disk = vcloud_disk.vCloudBootDisk(
-        disk_spec, device_path)
-    #self.boot_disk_allocated = True
-    self.scratch_disks.append(scratch_disk)
-    #scratch_disk.Create()
-    path = disk_spec.mount_point
-    mk_cmd = 'sudo mkdir -p {0}; sudo chown -R $USER:$USER {0};'.format(path)
-    self.RemoteCommand(mk_cmd)
+    free_blk_devices = []
+    for dev in block_devices:
+      if self._IsDiskAvailable(dev):
+        free_blk_devices.append(dev)
+    if not free_blk_devices:
+      raise errors.Error(
+          ''.join(('Machine type %s does not include' % self.machine_type,
+                   ' local disks. Please use a different disk_type,',
+                   ' or a machine_type that provides local disks.')))
+    elif len(free_blk_devices) < disk_spec.num_striped_disks:
+      raise errors.Error('Not enough local data disks. '
+                         'Requesting %d disk(s) but only %d available.'
+                         % (disk_spec.num_striped_disks, len(free_blk_devices)))
+    return free_blk_devices
+
+  def _GetBlockDevices(self):
+    """Execute command on VM to gather all block devices in the VM.
+
+    Returns:
+      list of dicts block devices in the VM.
+    """
+    stdout, _ = self.RemoteCommand(
+        'sudo lsblk -o NAME,MODEL,SIZE,TYPE,MOUNTPOINT,LABEL -n -b -P')
+    lines = stdout.splitlines()
+    groups = [LSBLK_PATTERN.match(line) for line in lines]
+    tuples = [g.groups() for g in groups if g]
+    colnames = ('name', 'model', 'size_bytes', 'type', 'mountpoint', 'label',)
+    blk_devices = [dict(zip(colnames, t)) for t in tuples]
+    for d in blk_devices:
+      d['model'] = d['model'].rstrip()
+      d['label'] = d['label'].rstrip()
+      d['size_bytes'] = int(d['size_bytes'])
+    return blk_devices
+
+  def _GetBootDevice(self):
+    """Returns backing block device where '/' is mounted on.
+
+    Returns:
+      dict blk device data
+
+    Raises:
+      errors.Error indicates that could not find block device with '/'.
+    """
+    blk_devices = self._GetBlockDevices()
+    boot_blk_device = None
+    for dev in blk_devices:
+      if dev['mountpoint'] == '/':
+        boot_blk_device = dev
+        break
+    if boot_blk_device is None:  # Unlikely
+      raise errors.Error('Could not find disk with "/" root mount point.')
+    if boot_blk_device['type'] == 'lvm':   # If LVM disk, then find the /boot mount point.
+      boot_blk_device = None
+      for dev in blk_devices:
+        if dev['mountpoint'] == '/boot':
+          boot_blk_device = dev
+          break
+      if boot_blk_device is None:
+        raise errors.Error('root mount point is LVM, and could not find "/boot".')
+    if boot_blk_device['type'] != 'part':
+      return boot_blk_device
+    return self._FindBootBlockDevice(blk_devices, boot_blk_device)
+
+  def _FindBootBlockDevice(self, blk_devices, boot_blk_device):
+    """Helper method to search for backing block device of a partition."""
+    blk_device_name = boot_blk_device['name'].rstrip('0123456789')
+    for dev in blk_devices:
+      if dev['type'] == 'disk' and dev['name'] == blk_device_name:
+        boot_blk_device = dev
+        return boot_blk_device
+
+  def _IsDiskAvailable(self, blk_device):
+    """Returns True if a block device is available.
+
+    An available disk, is a disk that has not been allocated previously as
+    a data disk, or is not being used as boot disk.
+    """
+    return (blk_device['type'] != 'part' and
+            blk_device['type'] != 'lvm' and
+            blk_device['name'] != self.boot_device['name'] and
+            blk_device['name'] != 'fd0' and
+            'config' not in blk_device['label'] and
+            blk_device['name'] not in self.allocated_disks)
 
 
 class DebianBasedvCloudVirtualMachine(vCloudVirtualMachine,
