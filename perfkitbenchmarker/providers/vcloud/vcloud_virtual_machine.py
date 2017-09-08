@@ -21,6 +21,7 @@ import json
 import logging
 import re
 import tempfile
+import time
 
 from perfkitbenchmarker import errors
 from perfkitbenchmarker import flags
@@ -53,6 +54,11 @@ RHEL_IMAGE = 'Redhat'
 INSTANCE_EXISTS_STATUSES = frozenset(
     ['Powered on', 'Suspended', 'PAUSED', 'SHUTOFF', 'ERROR'])
 
+NAT_STARTPORT = 8000
+NAT_TYPE = 'DNAT'
+SSH_PORT = '22'
+SSH_PROTOCOL = 'tcp'
+
 class vCloudVmSpec(virtual_machine.BaseVmSpec):
   """Object containing the information needed to create a vCloudVirtualMachine.
 
@@ -80,6 +86,10 @@ class vCloudVmSpec(virtual_machine.BaseVmSpec):
       config_values['vcloud_network'] = flag_values.vcloud_network
     if flag_values['vcloud_catalog'].present:
       config_values['vcloud_catalog'] = flag_values.vcloud_catalog
+    if flag_values['vcloud_gateway'].present:
+      config_values['vcloud_gateway'] = flag_values.vcloud_gateway
+    if flag_values['vcloud_publicip'].present:
+      config_values['vcloud_publicip'] = flag_values.vcloud_publicip
 
   @classmethod
   def _GetOptionDecoderConstructions(cls):
@@ -95,7 +105,9 @@ class vCloudVmSpec(virtual_machine.BaseVmSpec):
         'vcloud_catalog': (option_decoders.StringDecoder, {'default': None}),
         'vcloud_media': (option_decoders.StringDecoder, {'default': None}),
         'vcloud_network': (option_decoders.StringDecoder, {'default': None}),
-        'vcloud_vdc': (option_decoders.StringDecoder, {'default': None})})
+        'vcloud_vdc': (option_decoders.StringDecoder, {'default': None}),
+        'vcloud_gateway': (option_decoders.StringDecoder, {'default': None}),
+        'vcloud_publicip': (option_decoders.StringDecoder, {'default': None})})
     return result
 
 class vCloudVirtualMachine(virtual_machine.BaseVirtualMachine):
@@ -116,11 +128,13 @@ class vCloudVirtualMachine(virtual_machine.BaseVirtualMachine):
     self.vcloud_catalog = vm_spec.vcloud_catalog
     self.vcloud_vdc = vm_spec.vcloud_vdc
     self.vcloud_network = vm_spec.vcloud_network
+    self.vcloud_gateway = vm_spec.vcloud_gateway
+    self.vcloud_publicip = vm_spec.vcloud_publicip
     self.allocated_disks = set()
 
   def _CreateDependencies(self):
     """Create dependencies prior creating the VM."""
-    # TODO(meteorfox) Create security group (if applies)
+    # TODO(dwoolger) Create organisation network if it doesn't ready exist
 
   def _Create(self):
     """Creates a vCloud VM instance and waits until it's ACTIVE."""
@@ -136,7 +150,14 @@ class vCloudVirtualMachine(virtual_machine.BaseVirtualMachine):
     stdout, _, _ = get_cmd.Issue()
     resp = json.loads(stdout)
     self.internal_ip = resp['vms'][0]['IPs']
-    self.ip_address = resp['vms'][0]['IPs']
+    if self.vcloud_publicip is None:
+      self.ip_address = self.internal_ip
+    else:
+      self.ip_address = self.vcloud_publicip
+      ip_octets = self.internal_ip.split('.')
+      self.ssh_port = int(ip_octets[3]) + NAT_STARTPORT
+      self._GatewayNATAdd()
+      self._GatewayFWAdd()
 
   def _Exists(self):
     """Returns true if the VM exists otherwise returns false."""
@@ -160,13 +181,14 @@ class vCloudVirtualMachine(virtual_machine.BaseVirtualMachine):
     """Deletes a vCloud VM instance and waits until API returns 404."""
     if self.id is None:
       return
+    self._GatewayFWDelete()
+    self._GatewayNATDelete()
     self._DeleteInstance()
     self._WaitForInstanceUntilDeleted()
 
   def _DeleteDependencies(self):
     """Deletes dependencies that were need for the VM after the VM has been
     deleted."""
-    # TODO(meteorfox) Delete security group (if applies)
 
   def _CreateInstance(self):
     """Generates and execute command for creating a vCloud VM."""
@@ -451,6 +473,79 @@ class vCloudVirtualMachine(virtual_machine.BaseVirtualMachine):
             blk_device['name'] != 'fd0' and
             'config' not in blk_device['label'] and
             blk_device['name'] not in self.allocated_disks)
+
+  def _GatewayNATAdd(self):
+    """Add a NAT rule to the Gateway device"""
+    get_cmd = util.vCloudCLICommand(self, 'nat', 'add')
+    get_cmd.flags['gateway'] = self.vcloud_gateway
+    get_cmd.flags['type'] = NAT_TYPE
+    get_cmd.flags['original-ip'] = self.vcloud_publicip
+    get_cmd.flags['original-port'] = self.ssh_port
+    get_cmd.flags['translated-ip'] = self.internal_ip
+    get_cmd.flags['translated-port'] = SSH_PORT
+    get_cmd.flags['protocol'] = SSH_PROTOCOL
+
+    _, stderr, retcode = get_cmd.Issue()
+    if "is busy completing an operation" in stderr:
+      time.sleep(10)
+      self._GatewayNATAdd()
+    else:
+      return retcode
+    
+  def _GatewayNATDelete(self):
+    """Remove a NAT rule from the Gateway device"""
+    get_cmd = util.vCloudCLICommand(self, 'nat', 'delete')
+    get_cmd.flags['gateway'] = self.vcloud_gateway
+    get_cmd.flags['type'] = NAT_TYPE
+    get_cmd.flags['original-ip'] = self.vcloud_publicip
+    get_cmd.flags['original-port'] = self.ssh_port
+    get_cmd.flags['translated-ip'] = self.internal_ip
+    get_cmd.flags['translated-port'] = SSH_PORT
+    get_cmd.flags['protocol'] = SSH_PROTOCOL
+
+    _, stderr, retcode = get_cmd.Issue()
+    if "is busy completing an operation" in stderr:
+      time.sleep(10)
+      self._GatewayNATAdd()
+    else:
+      return retcode
+
+  def _GatewayFWAdd(self):
+    """Add a Firewall rule to the Gateway device"""
+    get_cmd = util.vCloudCLICommand(self, 'firewall', 'add')
+    get_cmd.flags['gateway'] = self.vcloud_gateway
+    get_cmd.flags['description'] = self.id
+    get_cmd.flags['source-ip'] = 'external'
+    get_cmd.flags['source-port'] = 'Any'
+    get_cmd.flags['dest-ip'] = self.vcloud_publicip
+    get_cmd.flags['dest-port'] = self.ssh_port
+    get_cmd.flags['protocol'] = SSH_PROTOCOL
+
+    _, stderr, retcode = get_cmd.Issue()
+    if "is busy completing an operation" in stderr:
+      time.sleep(10)
+      self._GatewayFWAdd()
+    else:
+      return retcode
+    
+
+  def _GatewayFWDelete(self):
+    """Remove a Firewall rule from the Gateway device"""
+    get_cmd = util.vCloudCLICommand(self, 'firewall', 'delete')
+    get_cmd.flags['gateway'] = self.vcloud_gateway
+    get_cmd.flags['description'] = self.id
+    get_cmd.flags['source-ip'] = 'external'
+    get_cmd.flags['source-port'] = 'Any'
+    get_cmd.flags['dest-ip'] = self.vcloud_publicip
+    get_cmd.flags['dest-port'] = self.ssh_port
+    get_cmd.flags['protocol'] = SSH_PROTOCOL
+
+    _, stderr, retcode = get_cmd.Issue()
+    if "is busy completing an operation" in stderr:
+      time.sleep(10)
+      self._GatewayNATAdd()
+    else:
+      return retcode
 
 
 class DebianBasedvCloudVirtualMachine(vCloudVirtualMachine,

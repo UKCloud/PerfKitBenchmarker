@@ -26,3 +26,9 @@ flags.DEFINE_string('vcloud_network', None,
 
 flags.DEFINE_string('vcloud_catalog', None,
                     help='A string indicating which vCloud catalog to use.')
+
+flags.DEFINE_string('vcloud_gateway', None,
+                    help='The vCloud Gateway that the VMs site behind.')
+
+flags.DEFINE_string('vcloud_publicip', None,
+                    help='A public IP address to NAT access to VMs behind.')
