@@ -130,6 +130,8 @@ class vCloudVirtualMachine(virtual_machine.BaseVirtualMachine):
     self.vcloud_network = vm_spec.vcloud_network
     self.vcloud_gateway = vm_spec.vcloud_gateway
     self.vcloud_publicip = vm_spec.vcloud_publicip
+    self.nat_rule = None
+    self.fw_rule = None
     self.allocated_disks = set()
 
   def _CreateDependencies(self):
@@ -156,8 +158,18 @@ class vCloudVirtualMachine(virtual_machine.BaseVirtualMachine):
       self.ip_address = self.vcloud_publicip
       ip_octets = self.internal_ip.split('.')
       self.ssh_port = int(ip_octets[3]) + NAT_STARTPORT
-      self._GatewayNATAdd()
-      self._GatewayFWAdd()
+      if self.nat_rule is None:
+        retcode = self._GatewayNATAdd()
+        if retcode == 0:
+          self.nat_rule = retcode
+        else:
+          return retcode
+      if self.fw_rule is None:
+        retcode = self._GatewayFWAdd()
+        if retcode == 0:
+          self.fw_rule = retcode
+        else:
+          return retcode
 
   def _Exists(self):
     """Returns true if the VM exists otherwise returns false."""
@@ -474,41 +486,32 @@ class vCloudVirtualMachine(virtual_machine.BaseVirtualMachine):
             'config' not in blk_device['label'] and
             blk_device['name'] not in self.allocated_disks)
 
+  def _GatewayNATRule(self, action):
+    get_cmd = util.vCloudCLICommand(self, 'nat', action)
+    get_cmd.flags['gateway'] = self.vcloud_gateway
+    get_cmd.flags['type'] = NAT_TYPE
+    get_cmd.flags['original-ip'] = self.vcloud_publicip
+    get_cmd.flags['original-port'] = self.ssh_port
+    get_cmd.flags['translated-ip'] = self.internal_ip
+    get_cmd.flags['translated-port'] = SSH_PORT
+    get_cmd.flags['protocol'] = SSH_PROTOCOL
+
+    stderr = "is busy completing an operation"
+    while "is busy completing an operation" in stderr:
+      _, stderr, retcode = get_cmd.Issue()
+      if "is busy completing an operation" in stderr:
+        time.sleep(10)
+    return retcode
+    
   def _GatewayNATAdd(self):
     """Add a NAT rule to the Gateway device"""
-    get_cmd = util.vCloudCLICommand(self, 'nat', 'add')
-    get_cmd.flags['gateway'] = self.vcloud_gateway
-    get_cmd.flags['type'] = NAT_TYPE
-    get_cmd.flags['original-ip'] = self.vcloud_publicip
-    get_cmd.flags['original-port'] = self.ssh_port
-    get_cmd.flags['translated-ip'] = self.internal_ip
-    get_cmd.flags['translated-port'] = SSH_PORT
-    get_cmd.flags['protocol'] = SSH_PROTOCOL
+    retcode = self._GatewayNATRule('add')
+    return retcode
 
-    _, stderr, retcode = get_cmd.Issue()
-    if "is busy completing an operation" in stderr:
-      time.sleep(10)
-      self._GatewayNATAdd()
-    else:
-      return retcode
-    
   def _GatewayNATDelete(self):
     """Remove a NAT rule from the Gateway device"""
-    get_cmd = util.vCloudCLICommand(self, 'nat', 'delete')
-    get_cmd.flags['gateway'] = self.vcloud_gateway
-    get_cmd.flags['type'] = NAT_TYPE
-    get_cmd.flags['original-ip'] = self.vcloud_publicip
-    get_cmd.flags['original-port'] = self.ssh_port
-    get_cmd.flags['translated-ip'] = self.internal_ip
-    get_cmd.flags['translated-port'] = SSH_PORT
-    get_cmd.flags['protocol'] = SSH_PROTOCOL
-
-    _, stderr, retcode = get_cmd.Issue()
-    if "is busy completing an operation" in stderr:
-      time.sleep(10)
-      self._GatewayNATAdd()
-    else:
-      return retcode
+    retcode = self._GatewayNATRule('delete')
+    return retcode
 
   def _GatewayFWAdd(self):
     """Add a Firewall rule to the Gateway device"""
@@ -524,10 +527,9 @@ class vCloudVirtualMachine(virtual_machine.BaseVirtualMachine):
     _, stderr, retcode = get_cmd.Issue()
     if "is busy completing an operation" in stderr:
       time.sleep(10)
-      self._GatewayFWAdd()
+      retcode = self._GatewayFWAdd()
     else:
       return retcode
-    
 
   def _GatewayFWDelete(self):
     """Remove a Firewall rule from the Gateway device"""
@@ -543,7 +545,7 @@ class vCloudVirtualMachine(virtual_machine.BaseVirtualMachine):
     _, stderr, retcode = get_cmd.Issue()
     if "is busy completing an operation" in stderr:
       time.sleep(10)
-      self._GatewayNATAdd()
+      retcode = self._GatewayFWDelete()
     else:
       return retcode
 
