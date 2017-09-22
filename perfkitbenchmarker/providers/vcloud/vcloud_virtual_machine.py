@@ -483,6 +483,8 @@ class vCloudVirtualMachine(virtual_machine.BaseVirtualMachine):
             blk_device['type'] != 'lvm' and
             blk_device['name'] != self.boot_device['name'] and
             blk_device['name'] != 'fd0' and
+            blk_device['name'] != 'sr0' and
+            blk_device['mountpoint'] == '' and
             'config' not in blk_device['label'] and
             blk_device['name'] not in self.allocated_disks)
 
