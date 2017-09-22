@@ -47,6 +47,9 @@ class vCloudCLICommand(object):
     self.args = list(args)
     self.flags = OrderedDict()
     self.additional_flags = ['--json']
+    if FLAGS.vcloud_profile is not None:
+      self.additional_flags.append('--profile')
+      self.additional_flags.append(FLAGS.vcloud_profile)
 
   def __repr__(self):
     return '{0}({1})'.format(type(self).__name__, ' '.join(self._GetCommand()))

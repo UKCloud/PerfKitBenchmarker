@@ -32,3 +32,6 @@ flags.DEFINE_string('vcloud_gateway', None,
 
 flags.DEFINE_string('vcloud_publicip', None,
                     help='A public IP address to NAT access to VMs behind.')
+
+flags.DEFINE_string('vcloud_profile', None,
+                    help='vcd cli profile to use.')
